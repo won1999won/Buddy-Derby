@@ -1,33 +1,39 @@
 import React, { useState } from 'react';
 import axios from 'axios';
 
-function App() {
-  const [selectedImage, setSelectedImage] = useState(null);
-  const [processedImage, setProcessedImage] = useState(null);
-  const [poseImage, setPoseImage] = useState(null);
-  const [feedback, setFeedback] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [manualPrompt, setManualPrompt] = useState('');
-  const [useManualPrompt, setUseManualPrompt] = useState(false);
+const App = () => {
+  const [file, setFile] = useState(null);
+  const [prompt, setPrompt] = useState('');
+  const [similarityThreshold, setSimilarityThreshold] = useState(10.0);
+  const [sketchMode, setSketchMode] = useState(false);
+  const [image, setImage] = useState(null);
+  const [message, setMessage] = useState('');
 
   const handleFileChange = (event) => {
-    setSelectedImage(event.target.files[0]);
+    setFile(event.target.files[0]);
   };
 
-  const handleUpload = async () => {
-    if (!selectedImage) {
-      alert('이미지를 선택해 주세요.');
-      return;
-    }
+  const handlePromptChange = (event) => {
+    setPrompt(event.target.value);
+  };
 
-    setLoading(true);
-    setProcessedImage(null);
-    setPoseImage(null);
-    setFeedback('');
+  const handleSimilarityThresholdChange = (event) => {
+    setSimilarityThreshold(parseFloat(event.target.value));
+  };
+
+  const handleSketchModeChange = (event) => {
+    setSketchMode(event.target.checked);
+  };
+
+  const handleSubmit = async (event) => {
+    event.preventDefault();
+    setMessage('');
 
     const formData = new FormData();
-    formData.append('file', selectedImage);
-    formData.append('prompt', useManualPrompt ? manualPrompt : ""); // 프롬프트 처리
+    formData.append('file', file);
+    formData.append('prompt', prompt);
+    formData.append('similarity_threshold', similarityThreshold);
+    formData.append('sketch_mode', sketchMode);
 
     try {
       const response = await axios.post('http://localhost:5000/generate/', formData, {
@@ -35,70 +41,61 @@ function App() {
           'Content-Type': 'multipart/form-data',
         },
       });
-      
-      const { image, pose_image, feedback } = response.data;
-      setProcessedImage(`data:image/png;base64,${image}`);
-      setPoseImage(pose_image ? `data:image/png;base64,${pose_image}` : null);
-      setFeedback(feedback);
+
+      if (response.data.image) {
+        setImage(`data:image/png;base64,${response.data.image}`);
+      }
+      setMessage(response.data.message);
     } catch (error) {
-      console.error('이미지 업로드 오류:', error);
-      alert('이미지 업로드 및 처리에 실패했습니다. 콘솔에서 자세한 내용을 확인하세요.');
-    } finally {
-      setLoading(false);
+      setMessage('Error occurred while processing the image.');
+      console.error(error);
     }
   };
 
   return (
-    <div className="App">
-      <h1>Stable Diffusion 이미지 처리</h1>
-      <input type="file" accept="image/*" onChange={handleFileChange} />
-      
-      <div>
-        <label>
-          <input
-            type="checkbox"
-            checked={useManualPrompt}
-            onChange={() => setUseManualPrompt(!useManualPrompt)}
-          />
-          수동 프롬프트 사용
-        </label>
-      </div>
-
-      {useManualPrompt && (
-        <textarea
-          value={manualPrompt}
-          onChange={(e) => setManualPrompt(e.target.value)}
-          placeholder="여기에 사용자 정의 프롬프트를 입력하세요"
-          style={{ width: '100%', height: '100px' }}
-        />
-      )}
-      
-      <button onClick={handleUpload}>업로드 및 처리</button>
-      
-      {loading && <p>이미지를 처리 중입니다. 잠시만 기다려 주세요...</p>}
-      
-      {poseImage && (
+    <div style={{ padding: '20px' }}>
+      <h1>Image Generation and Sketch Processing</h1>
+      <form onSubmit={handleSubmit}>
         <div>
-          <h2>포즈 이미지:</h2>
-          <img src={poseImage} alt="Pose" style={{ maxWidth: '100%' }} />
+          <label>
+            Image File:
+            <input type="file" accept="image/*" onChange={handleFileChange} required />
+          </label>
         </div>
-      )}
-
-      {processedImage && (
         <div>
-          <h2>처리된 이미지:</h2>
-          <img src={processedImage} alt="Processed" style={{ maxWidth: '100%' }} />
+          <label>
+            Prompt:
+            <input type="text" value={prompt} onChange={handlePromptChange} required />
+          </label>
         </div>
-      )}
-      
-      {feedback && (
         <div>
-          <h2>피드백:</h2>
-          <p>{feedback}</p>
+          <label>
+            Similarity Threshold:
+            <input
+              type="number"
+              step="0.1"
+              value={similarityThreshold}
+              onChange={handleSimilarityThresholdChange}
+              required
+            />
+          </label>
         </div>
-      )}
+        <div>
+          <label>
+            Sketch Mode:
+            <input
+              type="checkbox"
+              checked={sketchMode}
+              onChange={handleSketchModeChange}
+            />
+          </label>
+        </div>
+        <button type="submit">Submit</button>
+      </form>
+      {message && <p>{message}</p>}
+      {image && <img src={image} alt="Generated" style={{ marginTop: '20px', maxWidth: '100%' }} />}
     </div>
   );
-}
+};
 
 export default App;
