@@ -10,19 +10,27 @@ const App = () => {
   const [message, setMessage] = useState('');
 
   const handleFileChange = (event) => {
-    setFile(event.target.files[0]);
+    const selectedFile = event.target.files[0];
+    console.log('Selected file:', selectedFile);  // 콘솔 로그 추가
+    setFile(selectedFile);
   };
 
   const handlePromptChange = (event) => {
-    setPrompt(event.target.value);
+    const newPrompt = event.target.value;
+    console.log('Prompt:', newPrompt);  // 콘솔 로그 추가
+    setPrompt(newPrompt);
   };
 
   const handleSimilarityThresholdChange = (event) => {
-    setSimilarityThreshold(parseFloat(event.target.value));
+    const newThreshold = parseFloat(event.target.value);
+    console.log('Similarity Threshold:', newThreshold);  // 콘솔 로그 추가
+    setSimilarityThreshold(newThreshold);
   };
 
   const handleSketchModeChange = (event) => {
-    setSketchMode(event.target.checked);
+    const newSketchMode = event.target.checked;
+    console.log('Sketch Mode:', newSketchMode);  // 콘솔 로그 추가
+    setSketchMode(newSketchMode);
   };
 
   const handleSubmit = async (event) => {
@@ -35,6 +43,13 @@ const App = () => {
     formData.append('similarity_threshold', similarityThreshold);
     formData.append('sketch_mode', sketchMode);
 
+    console.log('Form Data:', {
+      file,
+      prompt,
+      similarityThreshold,
+      sketchMode,
+    });  // 콘솔 로그 추가
+
     try {
       const response = await axios.post('http://localhost:5000/generate/', formData, {
         headers: {
@@ -42,13 +57,18 @@ const App = () => {
         },
       });
 
+      console.log('Response:', response);  // 콘솔 로그 추가
+
       if (response.data.image) {
-        setImage(`data:image/png;base64,${response.data.image}`);
+        const imageSrc = `data:image/png;base64,${response.data.image}`;
+        console.log('Generated Image:', imageSrc);  // 콘솔 로그 추가
+        setImage(imageSrc);
       }
       setMessage(response.data.message);
+      console.log('Message:', response.data.message);  // 콘솔 로그 추가
     } catch (error) {
       setMessage('Error occurred while processing the image.');
-      console.error(error);
+      console.error('Error:', error);  // 콘솔 로그 추가
     }
   };
 

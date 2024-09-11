@@ -10,6 +10,8 @@ import base64
 import cv2
 import mediapipe as mp
 import io
+import torchvision.transforms as T
+from torchvision.models.segmentation import deeplabv3_resnet101, DeepLabV3_ResNet101_Weights
 
 app = FastAPI()
 
@@ -65,32 +67,17 @@ sd_model = load_models(model_id, controlnet_ids)
 
 # 스케치 이미지의 디테일을 개선하는 함수 (업그레이드된 버전)
 def enhance_sketch_image(image: np.array) -> np.array:
-    # 이미지를 그레이스케일로 변환
     gray_image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-
-    # 선명한 스케치 라인 만들기 (Canny Edge Detection 사용)
     edges = cv2.Canny(gray_image, threshold1=50, threshold2=150)
-
-    # 작은 노이즈 제거 및 선 두께 개선
     kernel = np.ones((3, 3), np.uint8)
-    edges_dilated = cv2.dilate(edges, kernel, iterations=1)  # 선을 두껍게 만듦
-    edges_eroded = cv2.erode(edges_dilated, kernel, iterations=1)  # 선을 적절히 얇게 복구
-
-    # 선의 흐름을 부드럽게 연결하여 자연스럽게 만듦
+    edges_dilated = cv2.dilate(edges, kernel, iterations=1)
+    edges_eroded = cv2.erode(edges_dilated, kernel, iterations=1)
     blurred_edges = cv2.GaussianBlur(edges_eroded, (3, 3), 0)
-
-    # 기존 선을 기반으로 끊긴 부분을 복구
     contours, _ = cv2.findContours(blurred_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     sketch_contours = np.zeros_like(blurred_edges)
     cv2.drawContours(sketch_contours, contours, -1, (255, 255, 255), thickness=cv2.FILLED)
-
-    # 스케치 라인을 부드럽게 하면서 선명도를 유지하는 필터 적용
     sketch_refined = cv2.adaptiveThreshold(sketch_contours, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-
-    # 해상도 향상 처리 (super_image 등의 라이브러리 활용 가능)
-    # enhanced_image = enhance_image_resolution(sketch_refined)
-
-    return cv2.cvtColor(sketch_refined, cv2.COLOR_GRAY2RGB)  # 결과 이미지를 RGB로 변환하여 반환
+    return cv2.cvtColor(sketch_refined, cv2.COLOR_GRAY2RGB)
 
 # OpenPose 전처리기
 def preprocess_openpose(image: np.array) -> np.array:
@@ -98,23 +85,12 @@ def preprocess_openpose(image: np.array) -> np.array:
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     results = mp_pose.process(image_rgb)
     
-    # 스케치 효과 적용
-    annotated_image = image.copy()
+    pose_image = np.zeros_like(image)
     if results.pose_landmarks:
         mp_drawing = mp.solutions.drawing_utils
-        mp_drawing.draw_landmarks(annotated_image, results.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
+        mp_drawing.draw_landmarks(pose_image, results.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
     
-    # 스케치 필터링 (선 정리)
-    sketch_image = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2GRAY)
-    sketch_image = cv2.GaussianBlur(sketch_image, (5, 5), 0)  # 부드러운 블러
-    sketch_image = cv2.adaptiveThreshold(sketch_image, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 11, 2)
-
-    # 선의 형태 보강
-    kernel = np.ones((3,3), np.uint8)
-    sketch_image = cv2.dilate(sketch_image, kernel, iterations=1)
-    sketch_image = cv2.erode(sketch_image, kernel, iterations=1)
-
-    return cv2.cvtColor(sketch_image, cv2.COLOR_GRAY2RGB)  # 이미지 채널을 다시 RGB로 변환
+    return pose_image
 
 # 포즈 추출 함수
 def extract_pose(image: np.array) -> dict:
@@ -162,7 +138,7 @@ def compare_pose(original_pose: dict, generated_pose: dict) -> float:
             num_comparisons += 1
 
     if num_comparisons == 0:
-        return 0.0  # 유사도 점수를 0으로 설정하여 무한대 대신 사용할 수 있습니다.
+        return 0.0
 
     average_distance = total_distance / num_comparisons
     return average_distance
@@ -188,24 +164,152 @@ def generate_openai_action_description(image: Image.Image) -> str:
         return "Unable to describe the action."
 
 # 스케치 모드에서 흑백 선화 생성 (하얀 배경에 검은 선)
-def generate_line_drawing_with_prompt(base_image: np.array, prompt: str) -> np.array:
-    # 1. 프롬프트를 적용하여 새로운 디자인을 추가한 이미지를 생성
-    generated_design = sd_model(prompt=prompt, negative_prompt="lowres, bad anatomy, text, worst quality", image=Image.fromarray(base_image), strength=0.8).images[0]
-    
-    # 2. 생성된 이미지를 흑백으로 변환
-    generated_design_np = np.array(generated_design.convert("L"))  # 흑백 변환
-    
-    # 3. 하얀 배경에 검은 선만 남도록 Canny Edge Detection 적용
-    edges = cv2.Canny(generated_design_np, threshold1=50, threshold2=150)
-    
-    # 4. 하얀 배경으로 변환 (모든 픽셀을 255로 설정하고, 검은 선만 남김)
-    line_drawing = np.ones_like(edges) * 255  # 모든 배경을 하얗게 설정
-    line_drawing[edges == 255] = 0  # 선을 검은색으로 설정
+def generate_line_drawing_with_pose(base_image: np.array, prompt: str, pose_image: np.array, negative_prompt: str, controlnet_strength: float = 0.5) -> np.array:
+    pose_pil = Image.fromarray(pose_image)
+    generated_design = sd_model(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        image=Image.fromarray(base_image),
+        controlnet_conditioning_image=pose_pil,
+        strength=controlnet_strength
+    ).images[0]
 
-    # 5. 결과물을 RGB로 변환 (흑백 선화이지만 3채널로 맞추기 위해)
+    generated_design_np = np.array(generated_design.convert("L"))
+    edges = cv2.Canny(generated_design_np, threshold1=50, threshold2=150)
+    line_drawing = np.ones_like(edges) * 255
+    line_drawing[edges == 255] = 0
     line_drawing_rgb = cv2.cvtColor(line_drawing, cv2.COLOR_GRAY2RGB)
-    
+
     return line_drawing_rgb
+
+# 얼굴, 손, 발을 탐지하는 함수
+def detect_face_hands_feet(image: np.array) -> dict:
+    results = {}
+
+    # 얼굴 탐지
+    mp_face_mesh = mp.solutions.face_mesh.FaceMesh(static_image_mode=True)
+    face_results = mp_face_mesh.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    if face_results.multi_face_landmarks:
+        face_landmarks = [face_landmark.landmark for face_landmark in face_results.multi_face_landmarks]
+        results['faces'] = face_landmarks
+
+    # 손 탐지
+    mp_hands = mp.solutions.hands.Hands(static_image_mode=True)
+    hand_results = mp_hands.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    if hand_results.multi_hand_landmarks:
+        hand_landmarks = [hand_landmark.landmark for hand_landmark in hand_results.multi_hand_landmarks]
+        results['hands'] = hand_landmarks
+
+    return results
+
+# 얼굴, 손 영역 보정
+def refine_face_hands_feet(image: np.array, landmarks: dict) -> np.array:
+    refined_image = image.copy()
+
+    if 'faces' in landmarks:
+        for face_landmark in landmarks['faces']:
+            face_coords = [(int(landmark.x * image.shape[1]), int(landmark.y * image.shape[0])) for landmark in face_landmark]
+            face_bbox = cv2.boundingRect(np.array(face_coords))
+            face_roi = refined_image[face_bbox[1]:face_bbox[1] + face_bbox[3], face_bbox[0]:face_bbox[0] + face_bbox[2]]
+
+    if 'hands' in landmarks:
+        for hand_landmark in landmarks['hands']:
+            hand_coords = [(int(landmark.x * image.shape[1]), int(landmark.y * image.shape[0])) for landmark in hand_landmark]
+            hand_bbox = cv2.boundingRect(np.array(hand_coords))
+            hand_roi = refined_image[hand_bbox[1]:hand_bbox[1] + hand_bbox[3], hand_bbox[0]:hand_bbox[0] + hand_bbox[2]]
+
+    return refined_image
+
+# 옷 영역 탐지 및 보정
+def detect_clothes(image: np.array) -> np.array:
+    print("Detecting clothes")
+    weights = DeepLabV3_ResNet101_Weights.DEFAULT
+    model = deeplabv3_resnet101(weights=weights).eval()
+
+    image_pil = Image.fromarray(image)
+    preprocess = weights.transforms()
+    input_tensor = preprocess(image_pil).unsqueeze(0)
+
+    with torch.no_grad():
+        output = model(input_tensor)['out'][0]
+    output_predictions = output.argmax(0).byte().cpu().numpy()
+
+    clothes_mask = (output_predictions == 17).astype(np.uint8) * 255
+    if clothes_mask.shape != image.shape[:2]:
+        clothes_mask = cv2.resize(clothes_mask, (image.shape[1], image.shape[0]))
+
+    return clothes_mask
+
+def refine_clothes(image: np.array, clothes_mask: np.array) -> np.array:
+    print("Refining clothes")
+    refined_image = image.copy()
+
+    clothes_region = cv2.bitwise_and(image, image, mask=clothes_mask)
+    clothes_region_enhanced = cv2.detailEnhance(clothes_region, sigma_s=10, sigma_r=0.15)
+    refined_image[clothes_mask == 255] = clothes_region_enhanced[clothes_mask == 255]
+
+    return refined_image
+
+# Stable Diffusion 업스케일러 로드
+def load_sd_upscaler():
+    model_id = "stabilityai/stable-diffusion-x4-upscaler"
+    sd_pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
+    sd_pipeline.to("cuda" if torch.cuda.is_available() else "cpu")
+    return sd_pipeline
+
+sd_upscaler = load_sd_upscaler()
+
+# 특정 영역 업스케일
+def upscale_with_stable_diffusion(image: np.array, region: tuple) -> np.array:
+    print("Upscaling with Stable Diffusion")
+    x, y, w, h = region
+    region_image = image[y:y+h, x:x+w]
+    region_pil = Image.fromarray(cv2.cvtColor(region_image, cv2.COLOR_BGR2RGB))
+
+    with torch.no_grad():
+        upscaled_region = sd_upscaler(prompt="", image=region_pil, strength=1).images[0]
+
+    upscaled_region_np = np.array(upscaled_region)
+    upscaled_region_bgr = cv2.cvtColor(upscaled_region_np, cv2.COLOR_RGB2BGR)
+    image[y:y+h, x:x+w] = upscaled_region_bgr
+
+    return image
+
+# 얼굴, 손, 무릎 영역 업스케일
+def apply_upscale_on_regions(image: np.array, landmarks: dict, min_face_size: int = 100) -> np.array:
+    refined_image = image.copy()
+    refined_image = upscale_small_faces(refined_image, landmarks, min_face_size)
+
+    if 'hands' in landmarks:
+        for hand_landmark in landmarks['hands']:
+            hand_coords = [(int(landmark.x * image.shape[1]), int(landmark.y * image.shape[0])) for landmark in hand_landmark]
+            hand_bbox = cv2.boundingRect(np.array(hand_coords))
+            refined_image = upscale_with_stable_diffusion(refined_image, hand_bbox)
+
+    return refined_image
+
+# 작은 얼굴 업스케일
+def upscale_small_faces(image: np.array, landmarks: dict, min_face_size: int = 100) -> np.array:
+    print("Upscaling small faces")
+    refined_image = image.copy()
+
+    if 'faces' in landmarks:
+        for face_landmark in landmarks['faces']:
+            face_size = detect_face_size(image, [face_landmark])
+            if face_size < min_face_size:
+                face_coords = [(int(landmark.x * image.shape[1]), int(landmark.y * image.shape[0])) for landmark in face_landmark]
+                face_bbox = cv2.boundingRect(np.array(face_coords))
+                refined_image = upscale_with_stable_diffusion(refined_image, face_bbox)
+
+    return refined_image
+
+# Mediapipe 얼굴 크기 감지
+def detect_face_size(image: np.array, face_landmarks) -> float:
+    if not face_landmarks:
+        return 0
+    face_coords = [(int(landmark.x * image.shape[1]), int(landmark.y * image.shape[0])) for landmark in face_landmarks[0]]
+    face_bbox = cv2.boundingRect(np.array(face_coords))
+    return face_bbox[2] * face_bbox[3]
 
 # 이미지 생성 엔드포인트
 @app.post("/generate/")
@@ -213,7 +317,9 @@ async def generate_image(
     file: UploadFile = File(...), 
     prompt: str = Form(...), 
     similarity_threshold: float = Form(10.0),
-    sketch_mode: bool = Form(False)  # 스케치 모드 매개변수 추가
+    sketch_mode: bool = Form(False),
+    controlnet_strength: float = Form(0.5),
+    min_face_size: int = Form(100)
 ):
     try:
         negative_prompt = "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, artist name, bad feet, bad legs, extra legs, extra limb, extra arm, extra hands, twisted fingers, cut fingers, weird fingers, weird hands, twisted hands, extra fingers, bad fingers,"
@@ -222,20 +328,20 @@ async def generate_image(
         image_np = np.array(image)
 
         if sketch_mode:
-            # 스케치 모드일 때는 스케치 처리 및 품질 개선 적용
-            processed_image_np = preprocess_openpose(image_np)  # 기존 전처리
-            enhanced_image_np = enhance_sketch_image(processed_image_np)  # 고품질 스케치로 변환
+            pose_image = preprocess_openpose(image_np)
+            final_line_drawing = generate_line_drawing_with_pose(image_np, prompt, pose_image, negative_prompt, controlnet_strength)
+
+            clothes_mask = detect_clothes(image_np)
+            final_line_drawing = refine_clothes(final_line_drawing, clothes_mask)
             
-            # 프롬프트에 따라 디테일을 추가한 흑백 선화 생성 (하얀 배경, 검은 선)
-            final_line_drawing = generate_line_drawing_with_prompt(enhanced_image_np, prompt)
+            landmarks = detect_face_hands_feet(image_np)
+            final_line_drawing = apply_upscale_on_regions(final_line_drawing, landmarks, min_face_size)
             
-            # 최종 선화 이미지를 저장하여 반환
             output = io.BytesIO()
             Image.fromarray(final_line_drawing).save(output, format='PNG')
             output.seek(0)
-            return JSONResponse(content={"message": "스케치 및 디테일 선화 생성 성공", "image": base64.b64encode(output.getvalue()).decode('utf-8')})
+            return JSONResponse(content={"message": "스케치 및 옷 보정 성공", "image": base64.b64encode(output.getvalue()).decode('utf-8')})
         
-        # 스케치 모드가 아닌 경우 기존 로직 수행
         original_pose = extract_pose(image_np)
         action_description = generate_openai_action_description(image)
         situation_description = "Some situation"
@@ -245,7 +351,13 @@ async def generate_image(
         generated_image = None
 
         while similarity_score == float('inf'):
-            generated_image = sd_model(prompt=final_prompt, negative_prompt=negative_prompt, num_inference_steps=120, image=image, strength=0.5).images[0]
+            generated_image = sd_model(
+                prompt=final_prompt, 
+                negative_prompt=negative_prompt,  
+                num_inference_steps=120, 
+                image=image, 
+                strength=0.5
+            ).images[0]
             
             if generated_image is not None:
                 generated_image_np = np.array(generated_image)
@@ -258,8 +370,14 @@ async def generate_image(
                     break
 
         if generated_image is not None:
+            clothes_mask = detect_clothes(image_np)
+            generated_image_np = refine_clothes(generated_image_np, clothes_mask)
+            
+            landmarks = detect_face_hands_feet(image_np)
+            generated_image_np = apply_upscale_on_regions(generated_image_np, landmarks, min_face_size)
+            
             output = io.BytesIO()
-            generated_image.save(output, format='PNG')
+            Image.fromarray(generated_image_np).save(output, format='PNG')
             output.seek(0)
             return JSONResponse(content={"message": "이미지 생성 성공", "image": base64.b64encode(output.getvalue()).decode('utf-8')})
 
